@@ -8,7 +8,6 @@ import (
 	"path"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	zfs "github.com/flynn/flynn/Godeps/_workspace/src/github.com/mistifyio/go-zfs"
 	"github.com/flynn/flynn/host/volume"
@@ -135,7 +134,7 @@ func (b *Provider) NewVolume() (volume.Volume, error) {
 	v := &zfsVolume{
 		info:      &volume.Info{ID: id},
 		provider:  b,
-		basemount: filepath.Join(b.config.WorkingDir, "/mnt/", id),
+		basemount: b.mountPath(id),
 	}
 	var err error
 	v.dataset, err = zfs.CreateFilesystem(path.Join(v.provider.dataset.Name, id), map[string]string{
@@ -148,17 +147,86 @@ func (b *Provider) NewVolume() (volume.Volume, error) {
 	return v, nil
 }
 
-func (b *Provider) DestroyVolume(vol volume.Volume) error {
+func (b *Provider) owns(vol volume.Volume) (*zfsVolume, error) {
 	zvol := b.volumes[vol.Info().ID]
 	if zvol == nil {
-		return fmt.Errorf("volume does not belong to this provider")
+		return nil, fmt.Errorf("volume does not belong to this provider")
 	}
-	if err := zvol.dataset.Destroy(zfs.DestroyRecursive | zfs.DestroyForceUmount); err != nil {
+	if zvol != vol { // these pointers should be canonical
+		panic(fmt.Errorf("volume does not belong to this provider"))
+	}
+	return zvol, nil
+}
+
+func (b Provider) mountPath(id string) string {
+	return filepath.Join(b.config.WorkingDir, "/mnt/", id)
+}
+
+func (b *Provider) DestroyVolume(vol volume.Volume) error {
+	zvol, err := b.owns(vol)
+	if err != nil {
+		return err
+	}
+	if err := zvol.dataset.Destroy(zfs.DestroyForceUmount); err != nil {
 		return err
 	}
 	os.Remove(zvol.basemount)
 	delete(b.volumes, vol.Info().ID)
 	return nil
+}
+
+func (b *Provider) CreateSnapshot(vol volume.Volume) (volume.Volume, error) {
+	zvol, err := b.owns(vol)
+	if err != nil {
+		return nil, err
+	}
+	id := random.UUID()
+	v2 := &zfsVolume{
+		info:      &volume.Info{ID: id},
+		provider:  zvol.provider,
+		basemount: b.mountPath(id),
+	}
+	v2.dataset, err = zvol.dataset.Snapshot(id, false)
+	if err != nil {
+		return nil, err
+	}
+	// mount the snapshot (readonly)
+	// 'zfs mount' currently can't perform on snapshots; seealso https://github.com/zfsonlinux/zfs/issues/173
+	os.MkdirAll(v2.basemount, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("could not mount snapshot: %s", err)
+	}
+	err = exec.Command("mount", "-tzfs", v2.dataset.Name, v2.basemount).Run()
+	if err != nil {
+		return nil, fmt.Errorf("could not mount snapshot: %s", err)
+	}
+	b.volumes[id] = v2
+	return v2, nil
+}
+
+func (b *Provider) ForkVolume(vol volume.Volume) (volume.Volume, error) {
+	zvol, err := b.owns(vol)
+	if err != nil {
+		return nil, err
+	}
+	if !vol.IsSnapshot() {
+		return nil, fmt.Errorf("can only fork a snapshot")
+	}
+	id := random.UUID()
+	v2 := &zfsVolume{
+		info:      &volume.Info{ID: id},
+		provider:  zvol.provider,
+		basemount: b.mountPath(id),
+	}
+	cloneID := fmt.Sprintf("%s/%s", zvol.provider.dataset.Name, id)
+	v2.dataset, err = zvol.dataset.Clone(cloneID, map[string]string{
+		"mountpoint": v2.basemount,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("could not fork volume: %s", err)
+	}
+	b.volumes[id] = v2
+	return v2, nil
 }
 
 func (v *zfsVolume) Provider() volume.Provider {
@@ -209,40 +277,6 @@ func (v *zfsVolume) Info() *volume.Info {
 	return v.info
 }
 
-func (v1 *zfsVolume) TakeSnapshot() (volume.Volume, error) {
-	id := random.UUID()
-	v2 := &zfsVolume{
-		info:      &volume.Info{ID: id},
-		provider:  v1.provider,
-		basemount: filepath.Join(v1.provider.config.WorkingDir, "/mnt/", id),
-	}
-	var err error
-	v2.dataset, err = cloneFilesystem(path.Join(v2.provider.dataset.Name, v2.info.ID), path.Join(v1.provider.dataset.Name, v1.info.ID), v2.basemount)
-	if err != nil {
-		return nil, err
-	}
-	v2.provider.volumes[id] = v2
-	return v2, nil
-}
-
-func cloneFilesystem(newDatasetName string, parentDatasetName string, mountPath string) (*zfs.Dataset, error) {
-	parentDataset, err := zfs.GetDataset(parentDatasetName)
-	if parentDataset == nil {
-		return nil, err
-	}
-	snapshotName := fmt.Sprintf("%d", time.Now().Nanosecond())
-	snapshot, err := parentDataset.Snapshot(snapshotName, false)
-	if err != nil {
-		return nil, err
-	}
-
-	dataset, err := snapshot.Clone(newDatasetName, map[string]string{
-		"mountpoint": mountPath,
-	})
-	if err != nil {
-		snapshot.Destroy(zfs.DestroyDeferDeletion)
-		return nil, err
-	}
-	err = snapshot.Destroy(zfs.DestroyDeferDeletion)
-	return dataset, err
+func (v *zfsVolume) IsSnapshot() bool {
+	return v.dataset.Type == zfs.DatasetSnapshot
 }
