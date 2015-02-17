@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"crypto/x509"
 	"encoding/pem"
@@ -11,6 +12,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -225,6 +227,10 @@ func handleChannel(conn *ssh.ServerConn, newChan ssh.NewChannel) {
 			}
 			if _, err := ch.SendRequest("exit-status", false, ssh.Marshal(&status)); err != nil {
 				fail("sendExit", err)
+				return
+			}
+			if err := uploadCache(cmdargs[1]); err != nil {
+				fail("uploadCache", err)
 			}
 			return
 		case "env":
@@ -307,6 +313,7 @@ func ensureCacheRepo(path string) error {
 	defer cacheMtx.Unlock()
 
 	cachePath := *repoPath + "/" + path
+
 	if _, err := os.Stat(cachePath); os.IsNotExist(err) {
 		os.MkdirAll(cachePath, 0755)
 		cmd := exec.Command("git", "init", "--bare")
@@ -316,5 +323,104 @@ func ensureCacheRepo(path string) error {
 			return err
 		}
 	}
+
+	res, err := http.Get("http://blobstore.discoverd/cache/" + path + ".tar")
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode == 200 {
+		r := tar.NewReader(res.Body)
+		for {
+			header, err := r.Next()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				return err
+			}
+
+			filename := cachePath + "/" + header.Name
+
+			switch header.Typeflag {
+			case tar.TypeDir:
+				if err := os.MkdirAll(filename, os.FileMode(header.Mode)); err != nil {
+					return err
+				}
+			case tar.TypeReg:
+				writer, err := os.Create(filename)
+				if err != nil {
+					return err
+				}
+				defer writer.Close()
+
+				io.Copy(writer, r)
+
+				if err := os.Chmod(filename, os.FileMode(header.Mode)); err != nil {
+					return err
+				}
+			default:
+			}
+		}
+	}
+
 	return ioutil.WriteFile(cachePath+"/hooks/pre-receive", prereceiveHook, 0755)
+}
+
+func uploadCache(path string) error {
+	cacheMtx.Lock()
+	defer cacheMtx.Unlock()
+
+	cachePath := *repoPath + "/" + path
+
+	buf := new(bytes.Buffer)
+	tw := tar.NewWriter(buf)
+
+	files, err := ioutil.ReadDir(cachePath)
+	if err != nil {
+		return err
+	}
+
+	for _, fileInfo := range files {
+		if fileInfo.IsDir() {
+			continue
+		}
+
+		file, err := os.Open(cachePath + "/" + fileInfo.Name())
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		hdr := &tar.Header{
+			Name:    file.Name(),
+			Size:    fileInfo.Size(),
+			Mode:    int64(fileInfo.Mode()),
+			ModTime: fileInfo.ModTime(),
+		}
+
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+
+		if _, err = io.Copy(tw, file); err != nil {
+			return err
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+
+	// upload the tarball to the blobstore
+	req, err := http.NewRequest("POST", "http://blobstore.discoverd/cache/"+path+".tar", buf)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return nil
 }
